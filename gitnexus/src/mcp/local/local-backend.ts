@@ -956,6 +956,27 @@ export class LocalBackend {
     }
     
     // Step 2: Disambiguation
+    // When multiple nodes share the same name (e.g. a Java Class and its
+    // Constructor both named 'SessionTracker'), prefer the Class node so
+    // context() returns the semantically meaningful result rather than
+    // triggering ambiguous disambiguation (#480).
+    // labels(n)[0] returns empty string in LadybugDB, so we resolve the
+    // preferred node by re-querying with explicit label filters.
+    if (symbols.length > 1 && !uid) {
+      const PREFER_LABELS = ['Class', 'Interface'];
+      let preferred: any = null;
+      for (const label of PREFER_LABELS) {
+        const match = await executeParameterized(repo.id, `
+          MATCH (n:\`${label}\`) WHERE n.name = $symName RETURN n.id AS id LIMIT 1
+        `, { symName: name! }).catch(() => []);
+        if (match.length > 0) {
+          preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
+          if (preferred) break;
+        }
+      }
+      if (preferred) symbols = [preferred];
+    }
+
     if (symbols.length > 1 && !uid) {
       return {
         status: 'ambiguous',
@@ -975,12 +996,56 @@ export class LocalBackend {
     const symId = sym.id || sym[0];
 
     // Categorized incoming refs
-    const incomingRows = await executeParameterized(repo.id, `
+    let incomingRows = await executeParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
+
+    // Fix #480: Class nodes have no direct CALLS/IMPORTS edges — those point
+    // to Constructor and File nodes respectively. Fetch those extra incoming
+    // refs and merge them in so context() shows the real callers/importers.
+    // Detect Class node by explicit label query since labels(n)[0] returns "".
+    let isClassNode = false;
+    try {
+      const classCheck = await executeParameterized(repo.id,
+        `MATCH (n:Class) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
+        { symId },
+      );
+      isClassNode = classCheck.length > 0;
+    } catch { /* not a Class node */ }
+
+    if (isClassNode) {
+      try {
+        const ctorIncoming = await executeParameterized(repo.id, `
+          MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
+          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+          MATCH (caller)-[r:CodeRelation]->(ctor)
+          WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
+          RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+          LIMIT 30
+        `, { symId });
+
+        const fileIncoming = await executeParameterized(repo.id, `
+          MATCH (f:File)-[rel:CodeRelation]->(n)
+          WHERE n.id = $symId
+          MATCH (caller)-[r:CodeRelation]->(f)
+          WHERE r.type IN ['CALLS', 'IMPORTS']
+          RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+          LIMIT 30
+        `, { symId });
+
+        // Deduplicate by uid before merging
+        const seenUids = new Set(incomingRows.map((r: any) => r.uid || r[1]));
+        for (const r of [...ctorIncoming, ...fileIncoming]) {
+          const uid = r.uid || r[1];
+          if (!seenUids.has(uid)) { seenUids.add(uid); incomingRows.push(r); }
+        }
+      } catch (e) {
+        logQueryError('context:class-incoming-expansion', e);
+      }
+    }
 
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
@@ -1021,7 +1086,7 @@ export class LocalBackend {
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: sym.type || sym[2],
+        kind: isClassNode ? 'Class' : (sym.type || sym[2]),
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
@@ -1446,21 +1511,96 @@ export class LocalBackend {
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
-    const targets = await executeParameterized(repo.id, `
-      MATCH (n)
-      WHERE n.name = $targetName
-      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-      LIMIT 1
-    `, { targetName: target });
-    if (targets.length === 0) return { error: `Target '${target}' not found` };
-    
-    const sym = targets[0];
+    // Resolve target by name, preferring Class/Interface over Constructor
+    // (fix #480: Java class and constructor share the same name).
+    // labels(n)[0] returns empty string in LadybugDB, so we query with
+    // explicit label filters in priority order to get the right node type.
+    const PRIORITY_LABELS = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+    let sym: any = null;
+    let symType = '';
+
+    for (const label of PRIORITY_LABELS) {
+      const rows = await executeParameterized(repo.id, `
+        MATCH (n:\`${label}\`)
+        WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+        LIMIT 1
+      `, { targetName: target }).catch(() => []);
+      if (rows.length > 0) {
+        sym = rows[0];
+        symType = label;
+        break;
+      }
+    }
+
+    // Fall back to unlabeled match for any other node type
+    if (!sym) {
+      const rows = await executeParameterized(repo.id, `
+        MATCH (n)
+        WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+        LIMIT 1
+      `, { targetName: target });
+      if (rows.length > 0) sym = rows[0];
+    }
+
+    if (!sym) return { error: `Target '${target}' not found` };
+
     const symId = sym.id || sym[0];
-    
+
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
     let traversalComplete = true;
+
+    // Fix #480: For Java (and other JVM) Class nodes, CALLS edges point to
+    // Constructor nodes and IMPORTS edges point to File nodes — not the Class
+    // itself. Seed the frontier with the class's Constructor(s) and owning
+    // File so the BFS traversal finds those edges naturally.
+    // The expanded nodes are also added to impacted at depth 1 so they appear
+    // in results (e.g. the File importer itself is a direct upstream dependency).
+    if (symType === 'Class') {
+      try {
+        const ctorRows = await executeParameterized(repo.id, `
+          MATCH (n)-[hm:CodeRelation]->(c:Constructor)
+          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+          RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+        `, { symId });
+        for (const r of ctorRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
+        }
+
+        const fileRows = await executeParameterized(repo.id, `
+          MATCH (f:File)-[rel:CodeRelation]->(n)
+          WHERE n.id = $symId
+          RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
+        `, { symId });
+        for (const r of fileRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) {
+            visited.add(rid);
+            frontier.push(rid);
+            // The owning File is itself a depth-1 upstream node — callers that
+            // import the class import this file, so surface it directly.
+            const fp = r.filePath || r[3] || '';
+            if (includeTests || !isTestFilePath(fp)) {
+              impacted.push({
+                depth: 1,
+                id: rid,
+                name: r.name || r[1],
+                type: r.type || r[2],
+                filePath: fp,
+                relationType: 'DEFINES',
+                confidence: 1.0,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        logQueryError('impact:class-node-expansion', e);
+      }
+    }
     
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
@@ -1605,8 +1745,8 @@ export class LocalBackend {
       target: {
         id: symId,
         name: sym.name || sym[1],
-        type: sym.type || sym[2],
-        filePath: sym.filePath || sym[3],
+        type: symType,
+        filePath: sym.filePath || sym[2],
       },
       direction,
       impactedCount: impacted.length,
