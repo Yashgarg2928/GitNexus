@@ -440,10 +440,13 @@ export class LocalBackend {
     
     // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25Results, semanticResults] = await Promise.all([
+    const [bm25SearchResult, semanticResults] = await Promise.all([
       this.bm25Search(repo, searchQuery, searchLimit),
       this.semanticSearch(repo, searchQuery, searchLimit),
     ]);
+
+    const bm25Results = bm25SearchResult.results;
+    const ftsUsed = bm25SearchResult.ftsUsed;
     
     // Merge via reciprocal rank fusion
     const scoreMap = new Map<string, { score: number; data: any }>();
@@ -617,21 +620,24 @@ export class LocalBackend {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
+      ...(!ftsUsed && { warning: 'FTS extension unavailable - keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.' }),
     };
   }
 
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
-  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<{ results: any[]; ftsUsed: boolean }> {
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
       bm25Results = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
-      return [];
+      return { results: [], ftsUsed: false };
     }
+
+    const ftsUsed = bm25Results.length === 0 || (bm25Results[0]?.ftsUsed !== false);
     
     const results: any[] = [];
     
@@ -677,7 +683,7 @@ export class LocalBackend {
       }
     }
     
-    return results;
+    return { results, ftsUsed };
   }
 
   /**
@@ -1036,11 +1042,15 @@ export class LocalBackend {
           LIMIT 30
         `, { symId });
 
-        // Deduplicate by uid before merging
-        const seenUids = new Set(incomingRows.map((r: any) => r.uid || r[1]));
+        // Deduplicate by (relType, uid) — a caller can have multiple relation
+        // types to the same target (e.g. both IMPORTS and CALLS), and each
+        // must be preserved so every category appears in the output.
+        const seenKeys = new Set(
+          incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
+        );
         for (const r of [...ctorIncoming, ...fileIncoming]) {
-          const uid = r.uid || r[1];
-          if (!seenUids.has(uid)) { seenUids.add(uid); incomingRows.push(r); }
+          const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
+          if (!seenKeys.has(key)) { seenKeys.add(key); incomingRows.push(r); }
         }
       } catch (e) {
         logQueryError('context:class-incoming-expansion', e);
