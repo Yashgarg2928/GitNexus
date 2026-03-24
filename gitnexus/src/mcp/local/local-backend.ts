@@ -1048,7 +1048,7 @@ export class LocalBackend {
 
         const fileIncoming = await executeParameterized(repo.id, `
           MATCH (f:File)-[rel:CodeRelation]->(n)
-          WHERE n.id = $symId
+          WHERE n.id = $symId AND rel.type = 'DEFINES'
           MATCH (caller)-[r:CodeRelation]->(f)
           WHERE r.type IN ['CALLS', 'IMPORTS']
           RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
@@ -1576,13 +1576,14 @@ export class LocalBackend {
     let frontier = [symId];
     let traversalComplete = true;
 
-    // Fix #480: For Java (and other JVM) Class nodes, CALLS edges point to
-    // Constructor nodes and IMPORTS edges point to File nodes — not the Class
-    // itself. Seed the frontier with the class's Constructor(s) and owning
-    // File so the BFS traversal finds those edges naturally.
-    // The expanded nodes are also added to impacted at depth 1 so they appear
-    // in results (e.g. the File importer itself is a direct upstream dependency).
-    if (symType === 'Class') {
+    // Fix #480: For Java (and other JVM) Class/Interface nodes, CALLS edges
+    // point to Constructor nodes and IMPORTS edges point to File nodes — not
+    // the Class/Interface itself. Seed the frontier with the Constructor(s)
+    // and owning File so the BFS traversal finds those edges naturally.
+    // The owning File is kept only as an internal seed (frontier/visited) and
+    // is NOT added to impacted — it is the definition container, not an
+    // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
+    if (symType === 'Class' || symType === 'Interface') {
       try {
         const ctorRows = await executeParameterized(repo.id, `
           MATCH (n)-[hm:CodeRelation]->(c:Constructor)
@@ -1594,17 +1595,15 @@ export class LocalBackend {
           if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
         }
 
+        // Restrict to DEFINES edges only — other File->Class edge types (if
+        // any) should not be treated as the owning file relationship.
         const fileRows = await executeParameterized(repo.id, `
           MATCH (f:File)-[rel:CodeRelation]->(n)
-          WHERE n.id = $symId
+          WHERE n.id = $symId AND rel.type = 'DEFINES'
           RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
         `, { symId });
         for (const r of fileRows) {
           const rid = r.id || r[0];
-          // Only seed into frontier/visited — the owning File is the definition
-          // container, not an upstream dependent. Adding it to impacted would
-          // inflate impactedCount and skew risk scoring. The BFS will naturally
-          // discover IMPORTS edges on this File at the next depth level.
           if (rid && !visited.has(rid)) {
             visited.add(rid);
             frontier.push(rid);
