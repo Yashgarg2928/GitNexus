@@ -31,11 +31,11 @@ const SEED = [
 
   // 1 production caller
   `CREATE (m1:Method {id: 'method:registerSessionTracker', name: 'registerSessionTracker', filePath: 'core/bootstrap/ServerBootstrap.java', startLine: 20, endLine: 30, isExported: false, content: '', description: ''})`,
-  // 4 test callers
-  `CREATE (m2:Method {id: 'method:setUp', name: 'setUp', filePath: 'api/session/SessionTrackerTest.java', startLine: 5, endLine: 10, isExported: false, content: '', description: ''})`,
-  `CREATE (m3:Method {id: 'method:constructor_nullGameMode_accepted', name: 'constructor_nullGameMode_accepted', filePath: 'api/session/SessionTrackerTest.java', startLine: 15, endLine: 22, isExported: false, content: '', description: ''})`,
-  `CREATE (m4:Method {id: 'method:constructor_nullServerId_accepted', name: 'constructor_nullServerId_accepted', filePath: 'api/session/SessionTrackerTest.java', startLine: 24, endLine: 31, isExported: false, content: '', description: ''})`,
-  `CREATE (m5:Method {id: 'method:startPlayerSession_passesGameModeAndServerId', name: 'startPlayerSession_passesGameModeAndServerId', filePath: 'api/session/SessionTrackerTest.java', startLine: 33, endLine: 42, isExported: false, content: '', description: ''})`,
+  // 4 test callers — use src/test/java/... paths so isTestFilePath() filters them
+  `CREATE (m2:Method {id: 'method:setUp', name: 'setUp', filePath: 'src/test/java/api/session/SessionTrackerTest.java', startLine: 5, endLine: 10, isExported: false, content: '', description: ''})`,
+  `CREATE (m3:Method {id: 'method:constructor_nullGameMode_accepted', name: 'constructor_nullGameMode_accepted', filePath: 'src/test/java/api/session/SessionTrackerTest.java', startLine: 15, endLine: 22, isExported: false, content: '', description: ''})`,
+  `CREATE (m4:Method {id: 'method:constructor_nullServerId_accepted', name: 'constructor_nullServerId_accepted', filePath: 'src/test/java/api/session/SessionTrackerTest.java', startLine: 24, endLine: 31, isExported: false, content: '', description: ''})`,
+  `CREATE (m5:Method {id: 'method:startPlayerSession_passesGameModeAndServerId', name: 'startPlayerSession_passesGameModeAndServerId', filePath: 'src/test/java/api/session/SessionTrackerTest.java', startLine: 33, endLine: 42, isExported: false, content: '', description: ''})`,
 
   // 1 importer file
   `CREATE (f2:File {id: 'file:ServerBootstrap.java', name: 'ServerBootstrap.java', filePath: 'core/bootstrap/ServerBootstrap.java', content: ''})`,
@@ -125,8 +125,8 @@ withTestLbugDB('java-class-impact', (handle) => {
     let backend: LocalBackend;
     beforeAll(async () => { backend = (handle as any)._backend; });
 
-    it('default call (no includeTests) finds the 1 production caller', async () => {
-      // This is the exact call from the issue: gitnexus_impact({target: "SessionTracker", direction: "upstream"})
+    it('default call (no includeTests) finds the 1 production caller and excludes test callers', async () => {
+      // Exact call from the issue: gitnexus_impact({target: "SessionTracker", direction: "upstream"})
       // Before fix: impactedCount: 0, risk: LOW, byDepth: {}
       const result = await backend.callTool('impact', {
         target: 'SessionTracker',
@@ -138,7 +138,15 @@ withTestLbugDB('java-class-impact', (handle) => {
 
       const d1 = result.byDepth[1] || result.byDepth['1'] || [];
       const names = d1.map((d: any) => d.name);
-      expect(names).toContain('registerSessionTracker'); // the 1 production caller
+
+      // Production caller must be present
+      expect(names).toContain('registerSessionTracker');
+
+      // Test callers must be excluded (paths match /test/ via isTestFilePath)
+      expect(names).not.toContain('setUp');
+      expect(names).not.toContain('constructor_nullGameMode_accepted');
+      expect(names).not.toContain('constructor_nullServerId_accepted');
+      expect(names).not.toContain('startPlayerSession_passesGameModeAndServerId');
     });
 
     it('with includeTests finds all 5 callers (1 prod + 4 tests)', async () => {
