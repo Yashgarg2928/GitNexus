@@ -967,20 +967,33 @@ export class LocalBackend {
     // context() returns the semantically meaningful result rather than
     // triggering ambiguous disambiguation (#480).
     // labels(n)[0] returns empty string in LadybugDB, so we resolve the
-    // preferred node by re-querying with explicit label filters.
+    // preferred node by re-querying with explicit label filters, scoped to
+    // the candidate IDs already in symbols.
+    //
+    // Guard: only attempt Class-preference when at least one candidate has an
+    // empty/unknown type (LadybugDB limitation) or is a Constructor — meaning
+    // the ambiguity may be a Class/Constructor name collision rather than two
+    // genuinely distinct symbols (e.g. two Functions in different files).
     if (symbols.length > 1 && !uid) {
-      const PREFER_LABELS = ['Class', 'Interface'];
-      let preferred: any = null;
-      for (const label of PREFER_LABELS) {
-        const match = await executeParameterized(repo.id, `
-          MATCH (n:\`${label}\`) WHERE n.name = $symName RETURN n.id AS id LIMIT 1
-        `, { symName: name! }).catch(() => []);
-        if (match.length > 0) {
-          preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
-          if (preferred) break;
+      const hasAmbiguousType = symbols.some((s: any) => {
+        const t = s.type || s[2] || '';
+        return t === '' || t === 'Constructor';
+      });
+      if (hasAmbiguousType) {
+        const candidateIds = symbols.map((s: any) => s.id || s[0]).filter(Boolean);
+        const PREFER_LABELS = ['Class', 'Interface'];
+        let preferred: any = null;
+        for (const label of PREFER_LABELS) {
+          const match = await executeParameterized(repo.id, `
+            MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1
+          `, { candidateIds }).catch(() => []);
+          if (match.length > 0) {
+            preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
+            if (preferred) break;
+          }
         }
+        if (preferred) symbols = [preferred];
       }
-      if (preferred) symbols = [preferred];
     }
 
     if (symbols.length > 1 && !uid) {
