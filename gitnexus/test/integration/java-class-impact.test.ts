@@ -69,11 +69,11 @@ const SEED = [
   `CREATE (fi3:File {id:'file:imp3.java', name:'RankManager.java', filePath:'core/rank/RankManager.java', content:''})`,
   `CREATE (fi4:File {id:'file:imp4.java', name:'RankConfig.java', filePath:'core/rank/RankConfig.java', content:''})`,
   `CREATE (fi5:File {id:'file:imp5.java', name:'RankAPI.java', filePath:'core/rank/RankAPI.java', content:''})`,
-  `CREATE (fi6:File {id:'file:imp6.java', name:'RankTest1.java', filePath:'core/rank/RankTest1.java', content:''})`,
-  `CREATE (fi7:File {id:'file:imp7.java', name:'RankTest2.java', filePath:'core/rank/RankTest2.java', content:''})`,
-  `CREATE (fi8:File {id:'file:imp8.java', name:'RankTest3.java', filePath:'core/rank/RankTest3.java', content:''})`,
-  `CREATE (fi9:File {id:'file:imp9.java', name:'RankTest4.java', filePath:'core/rank/RankTest4.java', content:''})`,
-  `CREATE (fi10:File {id:'file:imp10.java', name:'RankTest5.java', filePath:'core/rank/RankTest5.java', content:''})`,
+  `CREATE (fi6:File {id:'file:imp6.java', name:'RankTest1.java', filePath:'src/test/java/core/rank/RankTest1.java', content:''})`,
+  `CREATE (fi7:File {id:'file:imp7.java', name:'RankTest2.java', filePath:'src/test/java/core/rank/RankTest2.java', content:''})`,
+  `CREATE (fi8:File {id:'file:imp8.java', name:'RankTest3.java', filePath:'src/test/java/core/rank/RankTest3.java', content:''})`,
+  `CREATE (fi9:File {id:'file:imp9.java', name:'RankTest4.java', filePath:'src/test/java/core/rank/RankTest4.java', content:''})`,
+  `CREATE (fi10:File {id:'file:imp10.java', name:'RankTest5.java', filePath:'src/test/java/core/rank/RankTest5.java', content:''})`,
   `MATCH (a:File {id:'file:imp1.java'}), (b:File {id:'file:RankPermissionHandler.java'}) CREATE (a)-[:CodeRelation {type:'IMPORTS', confidence:0.9, reason:'import', step:0}]->(b)`,
   `MATCH (a:File {id:'file:imp2.java'}), (b:File {id:'file:RankPermissionHandler.java'}) CREATE (a)-[:CodeRelation {type:'IMPORTS', confidence:0.9, reason:'import', step:0}]->(b)`,
   `MATCH (a:File {id:'file:imp3.java'}), (b:File {id:'file:RankPermissionHandler.java'}) CREATE (a)-[:CodeRelation {type:'IMPORTS', confidence:0.9, reason:'import', step:0}]->(b)`,
@@ -134,7 +134,9 @@ withTestLbugDB('java-class-impact', (handle) => {
       });
 
       expect(result).not.toHaveProperty('error');
-      expect(result.impactedCount).toBeGreaterThanOrEqual(1);
+      // At minimum: 1 production caller (registerSessionTracker) + 1 file
+      // importer (ServerBootstrap.java discovered via BFS from the seeded File)
+      expect(result.impactedCount).toBeGreaterThanOrEqual(2);
 
       const d1 = result.byDepth[1] || result.byDepth['1'] || [];
       const names = d1.map((d: any) => d.name);
@@ -193,6 +195,28 @@ withTestLbugDB('java-class-impact', (handle) => {
 
       // Owning file must NOT appear in results
       expect(allNames).not.toContain('RankPermissionHandler.java');
+    });
+
+    it('RankPermissionHandler: default call (no includeTests) excludes test importers', async () => {
+      const result = await backend.callTool('impact', {
+        target: 'RankPermissionHandler',
+        direction: 'upstream',
+      });
+
+      expect(result).not.toHaveProperty('error');
+
+      const allNames = Object.values(result.byDepth as Record<string, any[]>)
+        .flat().map((d: any) => d.name);
+
+      // Production importers must be present
+      expect(allNames).toContain('RankCommand.java');
+
+      // Test importers (src/test/java/... paths) must be excluded
+      expect(allNames).not.toContain('RankTest1.java');
+      expect(allNames).not.toContain('RankTest2.java');
+      expect(allNames).not.toContain('RankTest3.java');
+      expect(allNames).not.toContain('RankTest4.java');
+      expect(allNames).not.toContain('RankTest5.java');
     });
   });
 
