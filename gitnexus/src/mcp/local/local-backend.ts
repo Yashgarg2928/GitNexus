@@ -974,6 +974,10 @@ export class LocalBackend {
     // empty/unknown type (LadybugDB limitation) or is a Constructor — meaning
     // the ambiguity may be a Class/Constructor name collision rather than two
     // genuinely distinct symbols (e.g. two Functions in different files).
+    //
+    // resolvedLabel is set here and threaded to Step 3 to avoid a redundant
+    // classCheck round-trip later.
+    let resolvedLabel = '';
     if (symbols.length > 1 && !uid) {
       const hasAmbiguousType = symbols.some((s: any) => {
         const t = s.type || s[2] || '';
@@ -989,7 +993,7 @@ export class LocalBackend {
           `, { candidateIds }).catch(() => []);
           if (match.length > 0) {
             preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
-            if (preferred) break;
+            if (preferred) { resolvedLabel = label; break; }
           }
         }
         if (preferred) symbols = [preferred];
@@ -1022,20 +1026,36 @@ export class LocalBackend {
       LIMIT 30
     `, { symId });
 
-    // Fix #480: Class nodes have no direct CALLS/IMPORTS edges — those point
-    // to Constructor and File nodes respectively. Fetch those extra incoming
-    // refs and merge them in so context() shows the real callers/importers.
-    // Detect Class node by explicit label query since labels(n)[0] returns "".
-    let isClassNode = false;
-    try {
-      const classCheck = await executeParameterized(repo.id,
-        `MATCH (n:Class) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
-        { symId },
-      );
-      isClassNode = classCheck.length > 0;
-    } catch { /* not a Class node */ }
+    // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
+    // those point to Constructor and File nodes respectively. Fetch those
+    // extra incoming refs and merge them in so context() shows real callers.
+    //
+    // Determine if this is a Class/Interface node. If resolvedLabel was set
+    // during disambiguation (Step 2), use it directly — no extra round-trip.
+    // Otherwise fall back to a single label check only when the type field is
+    // empty (LadybugDB labels(n)[0] limitation).
+    const symRawType = sym.type || sym[2] || '';
+    let isClassLike = resolvedLabel === 'Class' || resolvedLabel === 'Interface';
+    if (!isClassLike && symRawType === '') {
+      try {
+        const classCheck = await executeParameterized(repo.id,
+          `MATCH (n:Class) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
+          { symId },
+        );
+        isClassLike = classCheck.length > 0;
+        if (!isClassLike) {
+          const ifaceCheck = await executeParameterized(repo.id,
+            `MATCH (n:Interface) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
+            { symId },
+          );
+          isClassLike = ifaceCheck.length > 0;
+        }
+      } catch { /* not a Class/Interface node */ }
+    } else if (!isClassLike) {
+      isClassLike = symRawType === 'Class' || symRawType === 'Interface';
+    }
 
-    if (isClassNode) {
+    if (isClassLike) {
       try {
         const ctorIncoming = await executeParameterized(repo.id, `
           MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
@@ -1109,7 +1129,7 @@ export class LocalBackend {
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: isClassNode ? 'Class' : (sym.type || sym[2]),
+        kind: isClassLike ? (resolvedLabel || 'Class') : (sym.type || sym[2]),
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
@@ -1536,25 +1556,40 @@ export class LocalBackend {
 
     // Resolve target by name, preferring Class/Interface over Constructor
     // (fix #480: Java class and constructor share the same name).
-    // labels(n)[0] returns empty string in LadybugDB, so we query with
-    // explicit label filters in priority order to get the right node type.
-    const PRIORITY_LABELS = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+    // labels(n)[0] returns empty string in LadybugDB, so we use explicit
+    // label-typed sub-queries in a single UNION ordered by priority to avoid
+    // up to 6 serial round-trips for non-Class targets.
     let sym: any = null;
     let symType = '';
 
-    for (const label of PRIORITY_LABELS) {
+    try {
       const rows = await executeParameterized(repo.id, `
-        MATCH (n:\`${label}\`)
-        WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
-        LIMIT 1
+        MATCH (n:\`Class\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority
+        UNION ALL
+        MATCH (n:\`Interface\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority
+        UNION ALL
+        MATCH (n:\`Function\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority
+        UNION ALL
+        MATCH (n:\`Method\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority
+        UNION ALL
+        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority
       `, { targetName: target }).catch(() => []);
+
       if (rows.length > 0) {
-        sym = rows[0];
-        symType = label;
-        break;
+        // Pick the row with the lowest priority value (Class wins over Constructor)
+        const best = rows.reduce((a: any, b: any) =>
+          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
+        );
+        sym = best;
+        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
       }
-    }
+    } catch { /* fall through to unlabeled match */ }
 
     // Fall back to unlabeled match for any other node type
     if (!sym) {
