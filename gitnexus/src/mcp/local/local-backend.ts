@@ -1038,18 +1038,13 @@ export class LocalBackend {
     let isClassLike = resolvedLabel === 'Class' || resolvedLabel === 'Interface';
     if (!isClassLike && symRawType === '') {
       try {
-        const classCheck = await executeParameterized(repo.id,
-          `MATCH (n:Class) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
-          { symId },
-        );
-        isClassLike = classCheck.length > 0;
-        if (!isClassLike) {
-          const ifaceCheck = await executeParameterized(repo.id,
-            `MATCH (n:Interface) WHERE n.id = $symId RETURN n.id AS id LIMIT 1`,
-            { symId },
-          );
-          isClassLike = ifaceCheck.length > 0;
-        }
+        // Single UNION query instead of two serial round-trips.
+        const typeCheck = await executeParameterized(repo.id, `
+          MATCH (n:Class) WHERE n.id = $symId RETURN 'Class' AS label LIMIT 1
+          UNION ALL
+          MATCH (n:Interface) WHERE n.id = $symId RETURN 'Interface' AS label LIMIT 1
+        `, { symId });
+        isClassLike = typeCheck.length > 0;
       } catch { /* not a Class/Interface node */ }
     } else if (!isClassLike) {
       isClassLike = symRawType === 'Class' || symRawType === 'Interface';
@@ -1057,23 +1052,25 @@ export class LocalBackend {
 
     if (isClassLike) {
       try {
-        const ctorIncoming = await executeParameterized(repo.id, `
-          MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
-          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
-          MATCH (caller)-[r:CodeRelation]->(ctor)
-          WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
-          RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-          LIMIT 30
-        `, { symId });
-
-        const fileIncoming = await executeParameterized(repo.id, `
-          MATCH (f:File)-[rel:CodeRelation]->(n)
-          WHERE n.id = $symId AND rel.type = 'DEFINES'
-          MATCH (caller)-[r:CodeRelation]->(f)
-          WHERE r.type IN ['CALLS', 'IMPORTS']
-          RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-          LIMIT 30
-        `, { symId });
+        // Run both incoming-ref queries in parallel — they are independent.
+        const [ctorIncoming, fileIncoming] = await Promise.all([
+          executeParameterized(repo.id, `
+            MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            MATCH (caller)-[r:CodeRelation]->(ctor)
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+            LIMIT 30
+          `, { symId }),
+          executeParameterized(repo.id, `
+            MATCH (f:File)-[rel:CodeRelation]->(n)
+            WHERE n.id = $symId AND rel.type = 'DEFINES'
+            MATCH (caller)-[r:CodeRelation]->(f)
+            WHERE r.type IN ['CALLS', 'IMPORTS']
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+            LIMIT 30
+          `, { symId }),
+        ]);
 
         // Deduplicate by (relType, uid) — a caller can have multiple relation
         // types to the same target (e.g. both IMPORTS and CALLS), and each
@@ -1565,19 +1562,19 @@ export class LocalBackend {
     try {
       const rows = await executeParameterized(repo.id, `
         MATCH (n:\`Class\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
         UNION ALL
         MATCH (n:\`Interface\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
         UNION ALL
         MATCH (n:\`Function\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
         UNION ALL
         MATCH (n:\`Method\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
         UNION ALL
         MATCH (n:\`Constructor\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
       `, { targetName: target }).catch(() => []);
 
       if (rows.length > 0) {
@@ -1620,23 +1617,26 @@ export class LocalBackend {
     // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
     if (symType === 'Class' || symType === 'Interface') {
       try {
-        const ctorRows = await executeParameterized(repo.id, `
-          MATCH (n)-[hm:CodeRelation]->(c:Constructor)
-          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
-          RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
-        `, { symId });
+        // Run both seed queries in parallel — they are independent.
+        const [ctorRows, fileRows] = await Promise.all([
+          executeParameterized(repo.id, `
+            MATCH (n)-[hm:CodeRelation]->(c:Constructor)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+          `, { symId }),
+          // Restrict to DEFINES edges only — other File->Class edge types (if
+          // any) should not be treated as the owning file relationship.
+          executeParameterized(repo.id, `
+            MATCH (f:File)-[rel:CodeRelation]->(n)
+            WHERE n.id = $symId AND rel.type = 'DEFINES'
+            RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
+          `, { symId }),
+        ]);
+
         for (const r of ctorRows) {
           const rid = r.id || r[0];
           if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
         }
-
-        // Restrict to DEFINES edges only — other File->Class edge types (if
-        // any) should not be treated as the owning file relationship.
-        const fileRows = await executeParameterized(repo.id, `
-          MATCH (f:File)-[rel:CodeRelation]->(n)
-          WHERE n.id = $symId AND rel.type = 'DEFINES'
-          RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
-        `, { symId });
         for (const r of fileRows) {
           const rid = r.id || r[0];
           if (rid && !visited.has(rid)) {
