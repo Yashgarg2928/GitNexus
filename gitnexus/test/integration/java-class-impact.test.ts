@@ -149,7 +149,6 @@ withTestLbugDB('java-class-impact', (handle) => {
       });
 
       expect(result).not.toHaveProperty('error');
-      // 5 callers via Constructor + 1 File importer = 6 minimum
       expect(result.impactedCount).toBeGreaterThanOrEqual(5);
 
       const d1 = result.byDepth[1] || result.byDepth['1'] || [];
@@ -159,6 +158,12 @@ withTestLbugDB('java-class-impact', (handle) => {
       expect(names).toContain('constructor_nullGameMode_accepted');
       expect(names).toContain('constructor_nullServerId_accepted');
       expect(names).toContain('startPlayerSession_passesGameModeAndServerId');
+
+      // Owning file (SessionTracker.java) must NOT appear — it is the
+      // definition container, not an upstream dependent (#480 Copilot review)
+      const allNames = Object.values(result.byDepth as Record<string, any[]>)
+        .flat().map((d: any) => d.name);
+      expect(allNames).not.toContain('SessionTracker.java');
     });
 
     it('RankPermissionHandler: 1 caller via Constructor + 10 importers via File (was 0 before fix)', async () => {
@@ -169,13 +174,17 @@ withTestLbugDB('java-class-impact', (handle) => {
       });
 
       expect(result).not.toHaveProperty('error');
-      expect(result.impactedCount).toBeGreaterThanOrEqual(11); // 1 caller + 10 importers
+      // 1 caller (depth 1 via Constructor) + 10 importers (depth 2 via File)
+      expect(result.impactedCount).toBeGreaterThanOrEqual(11);
 
       const allNames = Object.values(result.byDepth as Record<string, any[]>)
         .flat().map((d: any) => d.name);
       expect(allNames).toContain('initRankHandler');
       expect(allNames).toContain('RankCommand.java');
       expect(allNames).toContain('RankManager.java');
+
+      // Owning file must NOT appear in results
+      expect(allNames).not.toContain('RankPermissionHandler.java');
     });
   });
 

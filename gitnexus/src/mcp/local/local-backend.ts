@@ -1588,23 +1588,13 @@ export class LocalBackend {
         `, { symId });
         for (const r of fileRows) {
           const rid = r.id || r[0];
+          // Only seed into frontier/visited — the owning File is the definition
+          // container, not an upstream dependent. Adding it to impacted would
+          // inflate impactedCount and skew risk scoring. The BFS will naturally
+          // discover IMPORTS edges on this File at the next depth level.
           if (rid && !visited.has(rid)) {
             visited.add(rid);
             frontier.push(rid);
-            // The owning File is itself a depth-1 upstream node — callers that
-            // import the class import this file, so surface it directly.
-            const fp = r.filePath || r[3] || '';
-            if (includeTests || !isTestFilePath(fp)) {
-              impacted.push({
-                depth: 1,
-                id: rid,
-                name: r.name || r[1],
-                type: r.type || r[2],
-                filePath: fp,
-                relationType: 'DEFINES',
-                confidence: 1.0,
-              });
-            }
           }
         }
       } catch (e) {
